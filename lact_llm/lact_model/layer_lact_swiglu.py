@@ -19,6 +19,7 @@ from einops import rearrange, repeat
 
 from .ttt_operation import (
     block_causal_lact_swiglu,
+    block_causal_lact_swiglu_rls,  # [RLS-ADD]
     prenorm_block_causal_lact_swiglu,
     l2_norm,
 )
@@ -147,6 +148,8 @@ class LaCTSWIGLULayer(nn.Module):
         fw_init_gain: float = 0.5,  # init the fast weights
         use_fused_kernel: bool = False,
         fp32_states: bool = False,
+        rls_cg_iters: int = 5,          # [RLS-ADD] CG iterations for full-P solve
+        rls_init_lambda: float = 0.1,   # [RLS-ADD] initial prior precision lambda
     ):
         super().__init__()
 
@@ -251,10 +254,23 @@ class LaCTSWIGLULayer(nn.Module):
         self.ttt_loss_type = ttt_loss_type
         self.use_fused_kernel = use_fused_kernel
         self.fp32_states = fp32_states
+        self.rls_cg_iters = rls_cg_iters          # [RLS-ADD]
+        self.rls_init_lambda = rls_init_lambda    # [RLS-ADD]
 
+        # [RLS-ADD] Allow Bayesian Leaky-RLS (full P_c and diagonal EWC ablation)
         assert self.ttt_loss_type in [
-            "dot_product"
+            "dot_product",
+            "bayesian_leaky_rls",
+            "bayesian_leaky_rls_diag",
         ], f"Loss type {self.ttt_loss_type} not supported"
+
+        # [RLS-ADD] Data-dependent forgetting gate gamma_c and learnable prior precision lambda
+        if self.ttt_loss_type.startswith("bayesian_leaky_rls"):
+            self.gamma_proj = nn.Linear(hidden_size, self.num_fw_heads)
+            nn.init.constant_(self.gamma_proj.bias, 3.0)  # sigmoid(3.0) ~= 0.953
+            self.log_rls_lambda = nn.Parameter(
+                torch.full((self.num_fw_heads, 1, 1), inv_softplus(rls_init_lambda))
+            )
 
     def _rescale_qk(self, q, k):
         """
@@ -488,7 +504,32 @@ class LaCTSWIGLULayer(nn.Module):
             fw_w2 = fw_w2.to(torch.float32)
 
         # [b * nh, s, d_ttt_head]
-        if self.ttt_prenorm:
+        # [RLS-ADD] Dispatch to Bayesian Leaky-RLS when enabled; baseline paths untouched
+        if self.ttt_loss_type.startswith("bayesian_leaky_rls"):
+            gamma = torch.sigmoid(self.gamma_proj(hidden_states).float())  # [b, s, nh]
+            gamma = rearrange(
+                gamma, "b s (n_h d) -> (b n_h) s d", n_h=self.num_fw_heads
+            )
+            rls_lam = F.softplus(self.log_rls_lambda.float()).repeat(batch_size, 1, 1)
+            fw_x = block_causal_lact_swiglu_rls(
+                fw_w0,
+                fw_w1,
+                fw_w2,
+                fast_q,
+                fast_k,
+                fast_v,
+                fw_lr1,
+                fw_lr2,
+                fw_lr3,
+                gamma=gamma,
+                rls_lambda=rls_lam,
+                chunk_size=self.lact_chunk_size,
+                use_muon=self.use_muon,
+                momentum=momentum,
+                diag_precision=(self.ttt_loss_type == "bayesian_leaky_rls_diag"),
+                cg_iters=self.rls_cg_iters,
+            )
+        elif self.ttt_prenorm:  # [RLS-ADD] changed from `if` to `elif`
             # pre-norm version of ttt.   state = state + f(norm(state))
             if self.use_fused_kernel:
                 fw_x = prenorm_block_causal_lact_swiglu_fused_kernel_triton(

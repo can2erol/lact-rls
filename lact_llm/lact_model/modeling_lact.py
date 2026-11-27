@@ -70,6 +70,8 @@ class LaCTBlock(nn.Module):
             fw_init_gain=config.fw_init_gain,
             use_fused_kernel=config.use_fused_kernel,
             fp32_states=config.fp32_states,
+            rls_cg_iters=config.rls_cg_iters,          # [RLS-ADD]
+            rls_init_lambda=config.rls_init_lambda,    # [RLS-ADD]
         )
 
         self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(
@@ -197,6 +199,10 @@ class LaCTPreTrainedModel(PreTrainedModel):
                 )
 
             nn.init.normal_(module.w1, mean=0.0, std=1.0 / math.sqrt(module.d_h))
+
+            # [RLS-ADD] Restore gamma_proj bias after post_init() zeroes nn.Linear biases
+            if hasattr(module, "gamma_proj"):
+                nn.init.constant_(module.gamma_proj.bias, 3.0)
 
 
 class LaCTModel(LaCTPreTrainedModel):

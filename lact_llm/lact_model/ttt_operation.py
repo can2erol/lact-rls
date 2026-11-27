@@ -362,3 +362,160 @@ def prenorm_block_causal_lact_swiglu(
     output[:, :, s_index:e_index] = torch.bmm(w1, gate * h)
 
     return output.transpose(1, 2)
+
+
+# Adding opearations for 
+
+@torch.compile()
+def cg_solve_3d(A: torch.Tensor, B: torch.Tensor, n_iters: int = 5, eps: float = 1e-6):
+    """
+    Batched Conjugate Gradient solver for A @ X = B (fp32).
+    A: [b, dh, dh] SPD precision matrix
+    B: [b, dh, dv] RHS
+    Returns X: [b, dh, dv]
+    """
+    X = torch.zeros_like(B)
+    R = B.clone()
+    P = R.clone()
+    rs_old = (R * R).sum(dim=1, keepdim=True)  # [b, 1, dv]
+
+    for _ in range(n_iters):
+        AP = torch.bmm(A, P)
+        alpha = rs_old / ((P * AP).sum(dim=1, keepdim=True) + eps)
+        X = X + alpha * P
+        R = R - alpha * AP
+        rs_new = (R * R).sum(dim=1, keepdim=True)
+        P = R + (rs_new / (rs_old + eps)) * P
+        rs_old = rs_new
+    return X
+
+
+@torch.compile()
+@torch.autocast(device_type="cuda", enabled=True, dtype=torch.bfloat16)
+def block_causal_lact_swiglu_rls(
+    w0: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    lr0: torch.Tensor,
+    lr1: torch.Tensor,
+    lr2: torch.Tensor,
+    gamma: torch.Tensor,  # [b, s, 1] fp32 in (0, 1)
+    rls_lambda: torch.Tensor,  # [b, 1, 1] fp32 > 0
+    chunk_size: int = 2048,
+    use_muon: bool = False,
+    momentum: torch.Tensor = None,
+    diag_precision: bool = False,
+    cg_iters: int = 5,
+):
+    """
+    Shifted Block-Causal LaCT-SwiGLU with Bayesian Leaky-RLS on readout w1.
+    w0, w2 use the standard LaCT update; w1 uses exact Bayesian Leaky-RLS:
+        P_c = gamma_c * P_{c-1} + (1 - gamma_c) * lambda * I + (1/C) * Phi_c * diag(lr1) * Phi_c^T
+        (W1_c - W1_{c-1}) @ P_c = (1/C) * R_c @ (diag(lr1) * Phi_c)^T + (1 - gamma_c) * lambda * (W1_0 - W1_{c-1})
+    """
+    b, dv, dh = w1.shape
+    w0_norm = w0.norm(dim=2, keepdim=True)
+    w2_norm = w2.norm(dim=2, keepdim=True)
+
+    w1_0 = w1.float()
+    w1_f = w1.float()
+
+    if diag_precision:
+        P_diag = rls_lambda.squeeze(-1).expand(b, dh).clone()  # [b, dh] fp32
+    else:
+        eye = torch.eye(dh, device=w1.device, dtype=torch.float32).unsqueeze(0)
+        P = rls_lambda * eye.expand(b, dh, dh).clone()  # [b, dh, dh] fp32
+
+    if momentum is not None:
+        dw0_momentum = torch.zeros_like(w0)
+        dw2_momentum = torch.zeros_like(w2)
+
+    q = q.transpose(1, 2)  # [b, dk, l]
+    v = v.transpose(1, 2)  # [b, dv, l]
+    output = torch.zeros_like(v)
+
+    e_index = 0
+    seq_len = k.shape[1]
+    for i in range(0, seq_len - chunk_size, chunk_size):
+        s_index = i
+        e_index = s_index + chunk_size
+        C = e_index - s_index
+
+        ki = k[:, s_index:e_index, :]          # [b, C, dk]
+        vi = v[:, :, s_index:e_index]          # [b, dv, C]
+        qi = q[:, :, s_index:e_index]          # [b, dk, C]
+        lr0i = lr0[:, s_index:e_index, :]      # [b, C, 1] fp32
+        lr1i = lr1[:, s_index:e_index, :]      # [b, C, 1] fp32
+        lr2i = lr2[:, s_index:e_index, :]      # [b, C, 1] fp32
+        gamma_c = gamma[:, s_index:e_index, :].mean(dim=1, keepdim=True)  # [b, 1, 1] fp32
+
+        # 1. Apply current fast weights to query chunk
+        h = torch.bmm(w2, qi)
+        gate = F.silu(torch.bmm(w0, qi), inplace=True)
+        output[:, :, s_index:e_index] = torch.bmm(w1_f.type_as(gate), gate * h)
+
+        # 2. Forward on key chunk
+        gate_before_act = torch.bmm(w0, ki.transpose(1, 2))
+        hidden_before_mul = torch.bmm(w2, ki.transpose(1, 2))
+        hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul  # [b, dh, C]
+
+        # 3. Update w0, w2 (standard LaCT path)
+        dhidden = torch.bmm(w1_f.type_as(vi).transpose(1, 2), vi)
+        dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
+        dgate = dhidden * hidden_before_mul
+        dgate_before_act = silu_backprop(dgate, gate_before_act)
+
+        dw0 = torch.bmm(dgate_before_act, (ki * lr0i).type_as(dgate_before_act))
+        dw2 = torch.bmm(dhidden_before_mul, (ki * lr2i).type_as(dhidden_before_mul))
+
+        if momentum is not None:
+            m_i = momentum[:, s_index:e_index, :].mean(dim=1, keepdim=True)
+            dw0 = dw0 + dw0_momentum * m_i
+            dw2 = dw2 + dw2_momentum * m_i
+            dw0_momentum = dw0
+            dw2_momentum = dw2
+
+        if use_muon:
+            dw0 = zeropower_via_newtonschulz5(dw0)
+            dw2 = zeropower_via_newtonschulz5(dw2)
+
+        w0 = w0 + dw0
+        w2 = w2 + dw2
+        w0 = w0 / (w0.norm(dim=2, keepdim=True) + 1e-5) * w0_norm
+        w2 = w2 / (w2.norm(dim=2, keepdim=True) + 1e-5) * w2_norm
+
+        # 4. Bayesian Leaky-RLS update on readout w1 (strictly in fp32)
+        with torch.amp.autocast("cuda", enabled=False):
+            phi = hidden.float()                              # [b, dh, C]
+            w_phi = phi * lr1i.transpose(1, 2).float()        # [b, dh, C]
+            res = vi.float() - torch.bmm(w1_f, phi)           # [b, dv, C]
+            rhs = (
+                torch.bmm(res, w_phi.transpose(1, 2)) / C
+                + (1.0 - gamma_c) * rls_lambda * (w1_0 - w1_f)
+            )                                                 # [b, dv, dh]
+
+            if diag_precision:
+                H_diag = (w_phi * phi).sum(dim=-1) / C        # [b, dh]
+                g_flat = gamma_c.squeeze(-1)                  # [b, 1]
+                P_diag = g_flat * P_diag + (1.0 - g_flat) * rls_lambda.squeeze(-1) + H_diag
+                delta_w1 = rhs / (P_diag.unsqueeze(1) + 1e-6)
+            else:
+                H_c = torch.bmm(w_phi, phi.transpose(1, 2)) / C  # [b, dh, dh]
+                P = gamma_c * P + (1.0 - gamma_c) * rls_lambda * eye + H_c
+                delta_w1 = cg_solve_3d(P, rhs.transpose(1, 2), n_iters=cg_iters).transpose(1, 2)
+
+            w1_f = w1_f + delta_w1
+
+    # Last chunk: apply without updating
+    qi = q[:, :, e_index:seq_len]
+    h = torch.bmm(w2, qi)
+    gate = F.silu(torch.bmm(w0, qi), inplace=True)
+    output[:, :, e_index:seq_len] = torch.bmm(w1_f.type_as(gate), gate * h)
+
+    return output.transpose(1, 2)
+
+
+

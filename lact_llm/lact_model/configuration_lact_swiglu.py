@@ -65,6 +65,10 @@ class LaCTSWIGLUConfig(PretrainedConfig):
         fw_init_gain: float = 0.5,
         use_fused_kernel: bool = False,  # use triton kernel for ttt implementation
         fp32_states: bool = False,  # whether to keep the fast weights in fp32
+        # Changes
+        rls_cg_iters: int = 5,
+        rls_init_lambda: float = 0.1,
+
         **kwargs,
     ):
         self.hidden_size = hidden_size
@@ -108,6 +112,10 @@ class LaCTSWIGLUConfig(PretrainedConfig):
         self.fw_init_gain = fw_init_gain
         self.use_fused_kernel = use_fused_kernel
         self.fp32_states = fp32_states
+        # Assigning added kwargs
+        self.rls_cg_iters = rls_cg_iters
+        self.rls_init_lambda = rls_init_lambda
+
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
